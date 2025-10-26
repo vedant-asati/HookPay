@@ -1,0 +1,17 @@
+{
+  "name": "nitrolite",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "main": "get_ledger_balances.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@erc7824/nitrolite": "^0.4.0",
+    "dotenv": "^17.2.3",
+    "ethers": "^6.15.0"
+  }
+}
