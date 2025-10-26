@@ -1,512 +1,243 @@
-"use strict";
-import EventEmitter from "events";
-import NitroliteClient, { RPCChannelStatus, RPCProtocolVersion } from "@erc7824/nitrolite";
-import { ethers } from "ethers";
-import WebSocket from "ws"; // Node.js
 import dotenv from "dotenv";
+import ClearNodeClient from "./ClearNodeClient.js";
+import { RPCChannelStatus } from "@erc7824/nitrolite";
+import { ethers } from "ethers";
 
 dotenv.config();
-const {
-  RPCMethod,
-  createAuthRequestMessage,
-  createAuthVerifyMessage,
-  createGetLedgerBalancesMessage,
-  createGetConfigMessage,
-  generateRequestId,
-  getCurrentTimestamp,
-  parseAnyRPCResponse,
-  createEIP712AuthMessageSigner,
-  createAuthVerifyMessageWithJWT,
-  createGetChannelsMessage,
-} = NitroliteClient;
 
-class ClearNodeConnection extends EventEmitter {
-  constructor(url, stateWallet, sessionWallet) {
-    super();
-    this.url = url;
-    this.stateWallet = stateWallet;
-    this.sessionWallet = sessionWallet;
-    this.ws = null;
-    this.authRequestPayload = null;
-    this.jwtToken = null;
-    this.sessionKey = null;
-    this.isConnected = false;
-    this.isAuthenticated = false;
-    this.reconnectAttempts = 0;
-    this.maxReconnectAttempts = 2;
-    this.reconnectInterval = 3000; // ms
-    this.requestMap = new Map(); // Track pending requests
+/**
+ * Display application banner
+ */
+function displayBanner() {
+  console.log("\n═══════════════════════════════════════════════════");
+  console.log("         ClearNode Channel Manager v1.0");
+  console.log("═══════════════════════════════════════════════════\n");
+}
+
+/**
+ * Display channel details in a formatted way
+ */
+function displayChannelDetails(channel, balances = null) {
+  console.log("\n┌─────────────────────────────────────────────────┐");
+  console.log(`│ Channel ID: ${channel.channel_id}`);
+  console.log(`│ Status: ${channel.status}`);
+  console.log(`│ Token: ${channel.token}`);
+
+  if (channel.participants && channel.participants.length > 0) {
+    console.log(`│ Participants:`);
+    channel.participants.forEach((p, i) => {
+      console.log(`│   ${i + 1}. ${p}`);
+    });
   }
 
-  // Message signer function
-  async messageSigner(payload) {
-    try {
-      const message = JSON.stringify(payload);
-      const digestHex = ethers.id(message);
-      const messageBytes = ethers.getBytes(digestHex);
-      const { serialized: signature } =
-        this.stateWallet.signingKey.sign(messageBytes);
-      return signature;
-    } catch (error) {
-      console.error("Error signing message:", error);
-      throw error;
+  if (balances) {
+    console.log(`│ Balances:`);
+    if (balances.balances && balances.balances.length > 0) {
+      balances.balances.forEach((balance) => {
+        console.log(`│   - Asset: ${balance.asset || "N/A"}`);
+        console.log(`│     Amount: ${balance.amount || "0"}`);
+      });
+    } else {
+      console.log(`│   No balance data available`);
     }
   }
+  console.log("└─────────────────────────────────────────────────┘");
+}
 
-  // Create a signed request
-  async createSignedRequest(
-    method,
-    params = [],
-    requestId = generateRequestId()
-  ) {
-    const timestamp = getCurrentTimestamp();
-    const requestData = [requestId, method, params, timestamp];
-    const request = { req: requestData };
+/**
+ * Display summary statistics
+ */
+function displaySummary(channels) {
+  const openCount = channels.filter(
+    (c) => c.status === RPCChannelStatus.Open
+  ).length;
+  const closedCount = channels.filter(
+    (c) => c.status === RPCChannelStatus.Closed
+  ).length;
+  const pendingCount = channels.length - openCount - closedCount;
 
-    // Sign the request
-    const signature = await this.messageSigner(request);
-    request.sig = [signature];
+  console.log("\n╔═══════════════════════════════════════════════════╗");
+  console.log("║                  CHANNEL SUMMARY                  ║");
+  console.log("╠═══════════════════════════════════════════════════╣");
+  console.log(`║ Total Channels:    ${String(channels.length).padEnd(31)}║`);
+  console.log(`║ Open Channels:     ${String(openCount).padEnd(31)}║`);
+  console.log(`║ Closed Channels:   ${String(closedCount).padEnd(31)}║`);
+  console.log(`║ Pending Channels:  ${String(pendingCount).padEnd(31)}║`);
+  console.log("╚═══════════════════════════════════════════════════╝\n");
+}
 
-    return { request, requestId };
+/**
+ * Fetch and display all channels with their balances
+ */
+async function displayAllChannelsWithBalances(client) {
+  console.log("\n📡 Fetching channels...");
+  const channels = await client.getChannels();
+  console.log(channels);
+  if (!channels || channels?.length === 0) {
+    console.log("\n❌ No channels found for this wallet.");
+    return;
   }
 
-  // Connect to the ClearNode
-  async connect() {
-    return new Promise((resolve, reject) => {
-      if (this.ws) {
-        this.ws.close();
+  displaySummary(channels);
+
+  // Display all channels
+  for (let i = 0; i < channels.length; i++) {
+    const channel = channels[i];
+    console.log(`\n[${i + 1}/${channels.length}] Processing channel...`);
+
+    // Fetch balances for open channels
+    let balances = null;
+    if (channel.status === RPCChannelStatus.Open) {
+      try {
+        console.log("   💰 Fetching balances...");
+        balances = await client.getLedgerBalances(channel.channel_id);
+      } catch (error) {
+        console.error(`   ⚠️  Failed to fetch balances: ${error.message}`);
       }
-
-      this.emit("connecting");
-
-      this.ws = new WebSocket(this.url);
-
-      // Set connection timeout
-      const connectionTimeout = setTimeout(() => {
-        if (!this.isConnected) {
-          this.ws.close();
-          reject(new Error("Connection timeout"));
-        }
-      }, 10000);
-
-      this.ws.on("open", async () => {
-        clearTimeout(connectionTimeout);
-        this.isConnected = true;
-        this.reconnectAttempts = 0;
-        this.emit("connected");
-
-        // Start authentication
-        try {
-          console.log("Trying to authenticate...");
-          if (this.jwtToken) {
-            const authRequest = await createAuthVerifyMessageWithJWT(
-              this.jwtToken
-            );
-            this.ws.send(authRequest);
-          } else {
-            const authRequestPayload = {
-              address: this.stateWallet.address,
-              session_key: this.sessionWallet.address,
-              app_name: "JSR App",
-              expire: (Math.floor(Date.now() / 1000) - 3600).toString(), // 10 days expiration (as string)
-              scope: "console",
-              application: "0x0000000000000000000000000000000000000000",
-              allowances: [],
-            };
-            this.authRequestPayload = authRequestPayload;
-            const authRequest = await createAuthRequestMessage(
-              authRequestPayload,
-              1,
-              Date.now()
-            );
-
-            this.ws.send(authRequest);
-            console.log(authRequest);
-          }
-          // Do not resolve here, wait for auth_success
-        } catch (error) {
-          this.emit("error", `Authentication request failed: ${error.message}`);
-          reject(error);
-        }
-      });
-
-      this.ws.on("message", async (data) => {
-        try {
-          const message = JSON.parse(data);
-          console.log("data: ", data);
-          console.log("message: ", message);
-          this.emit("message", message);
-
-          // Handle authentication flow
-          if (message.res && message.res[1] === RPCMethod.AuthChallenge) {
-            const parsedMessage = parseAnyRPCResponse(data);
-            try {
-              console.log("Trying to resolve authentication challenge...");
-
-              const walletClient = {
-                account: {
-                  address: this.stateWallet.address,
-                },
-                signTypedData: async ({
-                  domain,
-                  types,
-                  primaryType,
-                  message: msg,
-                }) => {
-                  const filteredTypes = { ...types };
-                  delete filteredTypes.EIP712Domain;
-                  const signature = await this.stateWallet.signTypedData(
-                    domain,
-                    filteredTypes,
-                    msg
-                  );
-                  return signature;
-                },
-              };
-
-              const eip712MessageSigner = createEIP712AuthMessageSigner(
-                walletClient,
-                {
-                  scope: this.authRequestPayload.scope,
-                  application: this.authRequestPayload.application,
-                  participant: this.authRequestPayload.session_key,
-                  expire: parseInt(this.authRequestPayload.expire), // 10 days expiration (as string)
-                  allowances: this.authRequestPayload.allowances,
-                },
-                {
-                  name: this.authRequestPayload.app_name,
-                }
-              );
-
-              const authVerify = await createAuthVerifyMessage(
-                eip712MessageSigner,
-                parsedMessage
-              );
-              console.log("Sending signed challenge...");
-              this.ws.send(authVerify);
-            } catch (error) {
-              this.emit(
-                "error",
-                `Authentication verification failed: ${error.message}`
-              );
-              reject(error);
-            }
-          } else if (message.res && (message.res[1] === RPCMethod.AuthVerify)) {
-            console.log("Auth success...");
-            this.isAuthenticated = true;
-            const jwtToken = parseAnyRPCResponse(data)?.params?.jwtToken;
-            const session_key = parseAnyRPCResponse(data)?.params?.sessionKey;
-            if(jwtToken){
-              this.jwtToken = jwtToken;
-              this.sessionKey = session_key;
-            }
-            console.log("this.jwtToken: ",this.jwtToken);
-            console.log("this.sessionKey: ",this.sessionKey);
-            this.emit("authenticated");
-            resolve(); // Authentication successful
-          } else if (message.res && message.res[1] === RPCMethod.Error) {
-            console.log("Auth failure...");
-            this.isAuthenticated = false;
-            const error = new Error(`Authentication failed: ${message.res[2]}`);
-            this.emit("error", error.message);
-            reject(error);
-          }
-
-          // Handle other response types
-          if (message.res && message.res[0]) {
-            const requestId = message.res[0];
-            const handler = this.requestMap.get(requestId);
-            if (handler) {
-              handler.resolve(message);
-              this.requestMap.delete(requestId);
-            }
-          }
-        } catch (error) {
-          console.error("Error handling message:", error);
-        }
-      });
-
-      this.ws.on("error", (error) => {
-        clearTimeout(connectionTimeout);
-        this.emit("error", `WebSocket error: ${error.message}`);
-        reject(error);
-      });
-
-      this.ws.on("close", (code, reason) => {
-        clearTimeout(connectionTimeout);
-        this.isConnected = false;
-        this.isAuthenticated = false;
-        this.emit("disconnected", { code, reason: reason.toString() });
-
-        // Attempt to reconnect
-        this.attemptReconnect();
-      });
-    });
-  }
-
-  // Send a request and wait for the response
-  async sendRequest(method, params = []) {
-    if (!this.isConnected || !this.isAuthenticated) {
-      throw new Error("Not connected or authenticated");
     }
 
-    const { request, requestId } = await this.createSignedRequest(
-      method,
-      params
-    );
-
-    return new Promise((resolve, reject) => {
-      // Set up response handler
-      const timeout = setTimeout(() => {
-        this.requestMap.delete(requestId);
-        reject(new Error(`Request timeout for ${method}`));
-      }, 30000);
-
-      this.requestMap.set(requestId, {
-        resolve: (response) => {
-          clearTimeout(timeout);
-          resolve(response);
-        },
-        reject,
-        timeout,
-      });
-
-      // Send the request
-      try {
-        this.ws.send(JSON.stringify(request));
-      } catch (error) {
-        clearTimeout(timeout);
-        this.requestMap.delete(requestId);
-        reject(error);
-      }
-    });
-  }
-
-  // Helper methods for common operations
-  async getChannels() {
-    // Using the built-in helper function from NitroliteRPC
-    const message = await createGetChannelsMessage(
-      (payload) => this.messageSigner(payload),
-      this.stateWallet.address
-    );
-
-    return new Promise((resolve, reject) => {
-      try {
-        const parsed = JSON.parse(message);
-        const requestId = parsed.req[0];
-
-        const timeout = setTimeout(() => {
-          this.requestMap.delete(requestId);
-          reject(new Error("Request timeout for getChannels"));
-        }, 30000);
-
-        this.requestMap.set(requestId, {
-          resolve: (response) => {
-            clearTimeout(timeout);
-            resolve(response);
-          },
-          reject,
-          timeout,
-        });
-
-        this.ws.send(message);
-      } catch (error) {
-        reject(error);
-      }
-    });
-  }
-
-  async getLedgerBalances(channelId) {
-    // Using the built-in helper function from NitroliteRPC
-    const message = await createGetLedgerBalancesMessage(
-      (payload) => this.messageSigner(payload),
-      channelId
-    );
-
-    return new Promise((resolve, reject) => {
-      try {
-        const parsed = JSON.parse(message);
-        const requestId = parsed.req[0];
-
-        const timeout = setTimeout(() => {
-          this.requestMap.delete(requestId);
-          reject(new Error("Request timeout for getLedgerBalances"));
-        }, 30000);
-
-        this.requestMap.set(requestId, {
-          resolve: (response) => {
-            clearTimeout(timeout);
-            resolve(response);
-          },
-          reject,
-          timeout,
-        });
-
-        this.ws.send(message);
-      } catch (error) {
-        reject(error);
-      }
-    });
-  }
-
-  async getConfig() {
-    // Using the built-in helper function from NitroliteRPC
-    const message = await createGetConfigMessage(
-      (payload) => this.messageSigner(payload),
-      this.stateWallet.address
-    );
-
-    return new Promise((resolve, reject) => {
-      try {
-        const parsed = JSON.parse(message);
-        const requestId = parsed.req[0];
-
-        const timeout = setTimeout(() => {
-          this.requestMap.delete(requestId);
-          reject(new Error("Request timeout for getConfig"));
-        }, 30000);
-
-        this.requestMap.set(requestId, {
-          resolve: (response) => {
-            clearTimeout(timeout);
-            resolve(response);
-          },
-          reject,
-          timeout,
-        });
-
-        this.ws.send(message);
-      } catch (error) {
-        reject(error);
-      }
-    });
-  }
-
-  // Attempt to reconnect with exponential backoff
-  attemptReconnect() {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      this.emit("error", "Maximum reconnection attempts reached");
-      return;
-    }
-
-    this.reconnectAttempts++;
-    const delay =
-      this.reconnectInterval * Math.pow(2, this.reconnectAttempts - 1);
-
-    this.emit("reconnecting", { attempt: this.reconnectAttempts, delay });
-
-    setTimeout(() => {
-      this.connect().catch((error) => {
-        console.error(
-          `Reconnection attempt ${this.reconnectAttempts} failed:`,
-          error
-        );
-      });
-    }, delay);
-  }
-
-  // Disconnect from the ClearNode
-  disconnect() {
-    if (this.ws) {
-      // Clear all pending requests
-      for (const [requestId, handler] of this.requestMap.entries()) {
-        clearTimeout(handler.timeout);
-        handler.reject(new Error("Connection closed"));
-        this.requestMap.delete(requestId);
-      }
-
-      this.ws.close(1000, "User initiated disconnect");
-      this.ws = null;
-    }
+    displayChannelDetails(channel, balances);
   }
 }
 
-// Example usage
-async function main() {
-  // Initialize your state wallet (this is just a placeholder)
-  //   const privateKey = '0x1234...'; // Your private key
-  const stateWallet = new ethers.Wallet(process.env.PRIVATE_KEY);
-  const sessionWallet = ethers.Wallet.createRandom();
+/**
+ * Get and display ClearNode configuration
+ */
+async function displayConfiguration(client) {
+  try {
+    console.log("\n⚙️  Fetching ClearNode configuration...");
+    const config = await client.getConfig();
 
-  // Create a ClearNode connection
-  const clearNode = new ClearNodeConnection(
+    console.log("\n╔═══════════════════════════════════════════════════╗");
+    console.log("║              CLEARNODE CONFIGURATION              ║");
+    console.log("╠═══════════════════════════════════════════════════╣");
+    console.log(
+      `║ ${JSON.stringify(config, null, 2).split("\n").join("\n║ ")}`
+    );
+    console.log("╚═══════════════════════════════════════════════════╝");
+  } catch (error) {
+    console.error(`⚠️  Failed to fetch configuration: ${error.message}`);
+  }
+}
+
+/**
+ * Display connection information
+ */
+function displayConnectionInfo(client) {
+  console.log("\n✅ Successfully connected and authenticated!");
+  console.log("\n┌─────────────────────────────────────────────────┐");
+  console.log("│              CONNECTION DETAILS                 │");
+  console.log("├─────────────────────────────────────────────────┤");
+  console.log(`│ Wallet Address: ${client.getAddress()}`);
+  console.log(`│ Session Key:    ${client.getSessionKey()}`);
+  console.log(`│ Connected:      ${client.isConnected}`);
+  console.log(`│ Authenticated:  ${client.isAuthenticated}`);
+  console.log("└─────────────────────────────────────────────────┘");
+}
+
+/**
+ * Main application entry point
+ */
+async function main() {
+  displayBanner();
+
+  // Validate environment variables
+  if (!process.env.WS_RPC_URL || !process.env.PRIVATE_KEY) {
+    console.error("❌ Error: Missing required environment variables!");
+    console.error(
+      "   Please ensure WS_RPC_URL and PRIVATE_KEY are set in .env file"
+    );
+    process.exit(1);
+  }
+
+  const primaryWallet = new ethers.Wallet(process.env.PRIVATE_KEY);
+  const sessionWallet = ethers.Wallet.createRandom();
+  // Create client with configuration
+  const client = new ClearNodeClient(
     process.env.WS_RPC_URL,
-    stateWallet,
-    sessionWallet
+    primaryWallet,
+    sessionWallet,
+    {
+      reconnect: {
+        maxAttempts: 3,
+        interval: 3000,
+      },
+      timeout: {
+        connection: 15000,
+        request: 30000,
+      },
+      auth: {
+        appName: "ClearNode Channel Manager",
+        scope: "console",
+        application: "0x0000000000000000000000000000000000000000",
+        expireDays: 10,
+      },
+    }
   );
 
-  // Set up event handlers
-  clearNode.on("message", (message) => {
-    console.log("Generic message from ClearNode...\n", message, "\n");
-  });
-  clearNode.on("connecting", () => {
-    console.log("Connecting to ClearNode...");
-  });
-
-  clearNode.on("connected", () => {
-    console.log("Connected to ClearNode");
-  });
-
-  clearNode.on("authenticated", () => {
-    console.log("Authenticated with ClearNode");
-  });
-
-  clearNode.on("disconnected", ({ code, reason }) => {
-    console.log(`Disconnected from ClearNode: ${code} ${reason}`);
-  });
-
-  clearNode.on("error", (error) => {
-    console.error(`ClearNode error: ${error}`);
-  });
-
-  clearNode.on("reconnecting", ({ attempt, delay }) => {
-    console.log(
-      `Reconnecting (${attempt}/${clearNode.maxReconnectAttempts}) in ${delay}ms...`
-    );
+  // Add custom event handlers for better UX
+  client.on("reconnecting", ({ attempt, delay }) => {
+    console.log(`\n🔄 Reconnection attempt ${attempt}... (waiting ${delay}ms)`);
   });
 
   try {
     // Connect and authenticate
-    await clearNode.connect();
-    console.log("Successfully connected and authenticated");
+    console.log("🔌 Connecting to ClearNode...");
+    await client.connect();
 
-    // Get channels
-    const channels = await clearNode.getChannels();
-    console.log("Channels:", channels.res[2][0]);
+    // Display connection info
+    displayConnectionInfo(client);
 
-    // Process the channels
-    const channelList = channels.res[2][0];
-    if (channelList && channelList.length > 0) {
-      for (const channel of channelList) {
-        console.log(`Channel ID: ${channel.channel_id}`);
-        console.log(`Status: ${channel.status}`);
-        console.log(`Token: ${channel.token}`);
+    // Display all channels with balances
+    await displayAllChannelsWithBalances(client);
 
-        // Get ledger balances for the channel
-        if (channel.status === RPCChannelStatus.Open) {
-          const balances = await clearNode.getLedgerBalances(
-            channel.channel_id
-          );
-          console.log(`Balances:`, balances.res[2]);
-        }
-      }
-    } else {
-      console.log("No channels found");
-    }
+    // Optionally display configuration
+    await displayConfiguration(client);
+
+    console.log("\n✨ All operations completed successfully!");
   } catch (error) {
-    console.error("Error:", error);
+    console.error("\n❌ Fatal Error:", error.message);
+    console.error("\nStack Trace:", error.stack);
+    process.exit(1);
   } finally {
-    // Disconnect when done
-    clearNode.disconnect();
+    // Always disconnect
+    console.log("\n🔌 Disconnecting from ClearNode...");
+    client.disconnect();
+    console.log("👋 Goodbye!\n");
   }
 }
 
-// Handle process termination
-process.on("SIGINT", () => {
-  console.log("Shutting down...");
-  // Clean up resources here
-  process.exit(0);
-});
+/**
+ * Handle graceful shutdown
+ */
+function setupGracefulShutdown() {
+  const shutdown = (signal) => {
+    console.log(`\n\n⚠️  Received ${signal}. Shutting down gracefully...`);
+    process.exit(0);
+  };
 
-// Run the example
-main().catch(console.error);
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+  // Handle uncaught exceptions
+  process.on("uncaughtException", (error) => {
+    console.error("\n❌ Uncaught Exception:", error);
+    process.exit(1);
+  });
+
+  // Handle unhandled promise rejections
+  process.on("unhandledRejection", (reason, promise) => {
+    console.error("\n❌ Unhandled Rejection at:", promise, "reason:", reason);
+    process.exit(1);
+  });
+}
+
+// Setup graceful shutdown handlers
+setupGracefulShutdown();
+
+// Run the application
+console.log("🚀 Starting ClearNode Channel Manager...\n");
+main().catch((error) => {
+  console.error("\n💥 Application crashed:", error);
+  process.exit(1);
+});
